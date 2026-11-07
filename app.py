@@ -21,7 +21,7 @@ uploaded_file = st.file_uploader("Upload Label Image (JPG, PNG)", type=["jpg", "
 if uploaded_file is not None and api_key:
     # Display the uploaded image
     image = Image.open(uploaded_file)
-    st.image(image, caption="Uploaded Label", use_column_width=True)
+    st.image(image, caption="Uploaded Label")
 
     if st.button("Process Label"):
         with st.spinner("Analyzing label with Gemini..."):
