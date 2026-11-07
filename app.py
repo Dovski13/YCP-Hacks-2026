@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 import pandas as pd
 from datetime import date
@@ -10,6 +11,9 @@ import base64
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy import create_engine
+import snowflake.snowpark as snowpark
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 
 # Configure the Streamlit page
 st.set_page_config(page_title="MRG Labs Label Scanner", layout="centered")
@@ -197,21 +201,6 @@ with tab1:
     if uploaded_files:
         st.write(f"**{len(uploaded_files)} images ready to process.**")
         
-        # Custom HTML to render thumbnails inside a pill-style container
-        custom_pills_html = "<div style='display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px;'>"
-        for f in uploaded_files:
-            img = Image.open(f)
-            img.thumbnail((60, 60))
-            img_b64 = get_image_base64(img)
-            custom_pills_html += f"""
-            <div style="display: flex; align-items: center; border: 1px solid #ddd; border-radius: 6px; padding: 6px 12px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-                <img src="data:image/png;base64,{img_b64}" style="width: 35px; height: 35px; margin-right: 12px; border-radius: 4px; object-fit: cover;">
-                <span style="font-size: 14px; color: #333; font-weight: 500;">{f.name}</span>
-            </div>
-            """
-        custom_pills_html += "</div>"
-        st.markdown(custom_pills_html, unsafe_allow_html=True)
-        
         user_file_name = st.text_input("Enter CSV file name:", "bulk_lab_samples_output")
         
         if st.button("Process All Labels"):
@@ -265,6 +254,148 @@ with tab1:
             mime="text/csv",
         )
 
+    # --- MINESWEEPER COMPONENT ---
+    st.markdown("---")
+    st.markdown("<h5 style='text-align: center; color: #004B87;'>Waiting for images to process? Play a round!</h5>", unsafe_allow_html=True)
+    
+    minesweeper_html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+        body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0; padding-top: 10px; color: #333; }
+        #board { display: grid; grid-template-columns: repeat(10, 30px); gap: 2px; margin-top: 10px; }
+        .cell { width: 30px; height: 30px; background-color: #f0f2f6; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 14px; cursor: pointer; border-radius: 4px; user-select: none; }
+        .cell:hover { background-color: #e0e2e6; }
+        .cell.revealed { background-color: #ffffff; border: 1px solid #ddd; cursor: default; box-sizing: border-box; }
+        .cell.mine { background-color: #ffcccc; }
+        #status { margin-top: 15px; font-weight: bold; min-height: 20px; color: #004B87; }
+        button { margin-top: 10px; padding: 8px 16px; border: none; background: #004B87; color: white; border-radius: 4px; cursor: pointer; font-size: 14px; transition: all 0.3s ease; }
+        button:hover { background: #005A9E; }
+    </style>
+    </head>
+    <body>
+        <div id="board"></div>
+        <div id="status"></div>
+        <button onclick="initGame()">Restart Game</button>
+        
+        <script>
+            const size = 10;
+            const mineCount = 12;
+            let board = [];
+            let revealed = 0;
+            let gameOver = false;
+
+            function initGame() {
+                board = Array(size).fill().map(() => Array(size).fill({ mine: false, revealed: false, flag: false, count: 0 }));
+                gameOver = false;
+                revealed = 0;
+                document.getElementById('status').innerText = "Right-click to flag mines";
+                
+                let minesPlaced = 0;
+                while (minesPlaced < mineCount) {
+                    let r = Math.floor(Math.random() * size);
+                    let c = Math.floor(Math.random() * size);
+                    if (!board[r][c].mine) {
+                        board[r][c] = { ...board[r][c], mine: true };
+                        minesPlaced++;
+                    }
+                }
+
+                for (let r = 0; r < size; r++) {
+                    for (let c = 0; c < size; c++) {
+                        if (!board[r][c].mine) {
+                            let count = 0;
+                            for (let dr = -1; dr <= 1; dr++) {
+                                for (let dc = -1; dc <= 1; dc++) {
+                                    if (r+dr >= 0 && r+dr < size && c+dc >= 0 && c+dc < size && board[r+dr][c+dc].mine) count++;
+                                }
+                            }
+                            board[r][c] = { ...board[r][c], count };
+                        }
+                    }
+                }
+                render();
+            }
+
+            function render() {
+                const b = document.getElementById('board');
+                b.innerHTML = '';
+                for (let r = 0; r < size; r++) {
+                    for (let c = 0; c < size; c++) {
+                        let cell = document.createElement('div');
+                        cell.className = 'cell';
+                        if (board[r][c].revealed) {
+                            cell.classList.add('revealed');
+                            if (board[r][c].mine) {
+                                cell.classList.add('mine');
+                                cell.innerText = '💣';
+                            } else if (board[r][c].count > 0) {
+                                cell.innerText = board[r][c].count;
+                                // Color code numbers
+                                const colors = ['#0000FF', '#008000', '#FF0000', '#000080', '#800000', '#008080', '#000000', '#808080'];
+                                cell.style.color = colors[board[r][c].count - 1];
+                            }
+                        } else if (board[r][c].flag) {
+                            cell.innerText = '🚩';
+                        }
+                        
+                        cell.onclick = () => reveal(r, c);
+                        cell.oncontextmenu = (e) => { e.preventDefault(); toggleFlag(r, c); };
+                        b.appendChild(cell);
+                    }
+                }
+            }
+
+            function reveal(r, c) {
+                if (gameOver || board[r][c].revealed || board[r][c].flag) return;
+                
+                let cell = board[r][c];
+                cell.revealed = true;
+                
+                if (cell.mine) {
+                    gameOver = true;
+                    document.getElementById('status').innerText = "Boom! Game Over.";
+                    document.getElementById('status').style.color = "red";
+                    revealAll();
+                } else {
+                    revealed++;
+                    if (revealed === size * size - mineCount) {
+                        gameOver = true;
+                        document.getElementById('status').innerText = "You Win! 🏆";
+                        document.getElementById('status').style.color = "green";
+                    } else if (cell.count === 0) {
+                        for (let dr = -1; dr <= 1; dr++) {
+                            for (let dc = -1; dc <= 1; dc++) {
+                                if (r+dr >= 0 && r+dr < size && c+dc >= 0 && c+dc < size) reveal(r+dr, c+dc);
+                            }
+                        }
+                    }
+                }
+                render();
+            }
+
+            function toggleFlag(r, c) {
+                if (gameOver || board[r][c].revealed) return;
+                board[r][c].flag = !board[r][c].flag;
+                render();
+            }
+
+            function revealAll() {
+                for (let r = 0; r < size; r++) {
+                    for (let c = 0; c < size; c++) {
+                        board[r][c].revealed = true;
+                    }
+                }
+            }
+
+            initGame();
+        </script>
+    </body>
+    </html>
+    """
+    components.html(minesweeper_html, height=450)
+
 with tab2:
     st.subheader("Live Database Records")
     
@@ -306,6 +437,72 @@ with tab2:
             
             # Note: Streamlit's native dataframe supports column sorting by clicking the headers
             st.dataframe(filtered_df.tail(100), use_container_width=True) 
+
+            st.divider()
+            st.markdown("#### ❄️ Snowflake AI Data Analyst")
+
+            if st.button("Ask Snowflake for Insights", use_container_width=True):
+                if filtered_df.empty:
+                    st.warning("No data available to analyze.")
+                else:
+                    with st.spinner("Connecting to Snowflake Cortex..."):
+                        try:
+                            # Load the private key
+                            with open("rsa_key.p8", "rb") as key:
+                                p_key = serialization.load_pem_private_key(
+                                    key.read(),
+                                    password=None,
+                                    backend=default_backend()
+                                )
+                            
+                            pkb = p_key.private_bytes(
+                                encoding=serialization.Encoding.DER,
+                                format=serialization.PrivateFormat.PKCS8,
+                                encryption_algorithm=serialization.NoEncryption()
+                            )
+
+                            # 1. Authenticate with Snowflake via Key Pair (Bypasses MFA)
+                            conn_params = {
+                                "account": os.environ.get("SNOWFLAKE_ACCOUNT"),
+                                "user": os.environ.get("SNOWFLAKE_USER"),
+                                "private_key": pkb,
+                                "role": "ACCOUNTADMIN",
+                                "warehouse": "COMPUTE_WH",
+                                "database": "HACKATHON_DB",
+                                "schema": "PUBLIC"
+                            }
+                            session = snowpark.Session.builder.configs(conn_params).create()
+                            
+                            # 2. Push Tiger DB data to Snowflake
+                            session.write_pandas(
+                                filtered_df, 
+                                table_name="LAB_SAMPLES_TEMP", 
+                                auto_create_table=True, 
+                                overwrite=True
+                            )
+                            
+                            # 3. Generate Insights using Snowflake Cortex (Native AI)
+                            summary_stats = filtered_df.describe(include='all').to_json()
+                            prompt = (
+                                f"You are a laboratory data analyst. Based on this summary of recent equipment "
+                                f"fluid samples, provide 3 brief, actionable insights or identify anomalies: {summary_stats}"
+                            )
+                            
+                            # Escape single quotes to prevent SQL syntax errors
+                            safe_prompt = prompt.replace("'", "''")
+                            
+                            # Query Cortex for Llama 3 LLM insights
+                            sql_query = f"SELECT AI_COMPLETE('llama3.1-8b', '{safe_prompt}') as INSIGHT"
+                            cortex_result = session.sql(sql_query).collect()
+                            
+                            st.success("Analysis Complete!")
+                            st.write(cortex_result[0]['INSIGHT'])
+                            
+                        except Exception as e:
+                            st.error(f"Snowflake Integration Error: {e}")
+
+
+
         else:
             st.warning("TIGERDATA_URI environment variable is not set.")
     except Exception as e:
