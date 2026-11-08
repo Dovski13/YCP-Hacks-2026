@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --brand:#004B87; --line:#e2e8f0; --bg:#fff; --head:#f1f5f9; --txt:#0f172a; --mut:#64748b;
+          --red-bg:#fee2e2; --red-tx:#991b1b; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; padding:0; font-family:"Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif;
+               font-size:13px; color:var(--txt); background:transparent; }
+  #wrap { display:flex; flex-direction:column; height:100vh; }
+  #hint { color:var(--mut); font-size:12px; padding:2px 2px 6px; }
+  #scroller { flex:1; overflow:auto; border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+  table { border-collapse:separate; border-spacing:0; width:100%; }
+  th { position:sticky; top:0; z-index:2; background:var(--head); text-align:left; font-weight:600;
+       padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  td { padding:6px 10px; border-bottom:1px solid #f1f5f9; white-space:nowrap; max-width:320px;
+       overflow:hidden; text-overflow:ellipsis; cursor:default; height:31px; }
+  td.ro { color:#475569; }
+  td.flag { background:var(--red-bg); color:var(--red-tx); font-weight:500; }
+  td.edited { box-shadow:inset 3px 0 0 var(--brand); font-style:italic; }
+  td.flagchg { outline:2px dashed #f59e0b; outline-offset:-2px; }
+  td.editing { padding:0; }
+  td input { width:100%; height:30px; border:2px solid var(--brand); outline:none; padding:0 8px;
+             font:inherit; background:#fff; color:var(--txt); }
+  tr:hover td:not(.flag) { background:#f8fafc; }
+  #menu { position:fixed; display:none; z-index:50; min-width:170px; background:#fff; border:1px solid var(--line);
+          border-radius:8px; box-shadow:0 8px 24px rgba(15,23,42,.18); padding:4px; }
+  #menu div { padding:7px 12px; border-radius:5px; cursor:pointer; user-select:none; }
+  #menu div:hover { background:#eff6ff; }
+  #menu div.dis { color:#94a3b8; cursor:not-allowed; background:none; }
+  #foot { display:flex; justify-content:space-between; align-items:center; height:48px; padding-top:8px; }
+  #pending { color:var(--mut); font-size:12px; visibility:hidden; }
+  #btns { display:flex; gap:8px; visibility:hidden; }
+  #foot.dirty #pending, #foot.dirty #btns { visibility:visible; }
+  button { font:inherit; font-weight:600; border-radius:6px; padding:7px 18px; cursor:pointer; border:1px solid var(--line); }
+  #cancel { background:#fff; color:var(--txt); }
+  #cancel:hover { background:#f1f5f9; }
+  #save { background:var(--brand); color:#fff; border-color:var(--brand); }
+  #save:hover { filter:brightness(1.1); }
+  button:disabled { opacity:.55; cursor:wait; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hint">Right-click a cell to edit, flag, or unflag it. Double-click also edits.</div>
+  <div id="scroller"><table id="tbl"></table></div>
+  <div id="foot">
+    <span id="pending"></span>
+    <span id="btns">
+      <button id="cancel">Cancel</button>
+      <button id="save">Save</button>
+    </span>
+  </div>
+</div>
+<div id="menu"></div>
+
+<script>
+(function () {
+  // ---- Streamlit component protocol (no build step needed) ----
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+  var S = { rows: [], columns: [], editable: [], flags: {}, version: null };
+  var pendingEdits = {};   // "row|col" -> {row, col, value}
+  var pendingFlags = {};   // "row|col" -> desired boolean (only when differs from original)
+  var saving = false, saveTimer = null, ctx = null;
+
+  var $tbl = document.getElementById("tbl"), $menu = document.getElementById("menu"),
+      $foot = document.getElementById("foot"), $pending = document.getElementById("pending");
+
+  var key = function (r, c) { return r + "|" + c; };
+  var origVal = function (row, c) { var v = row[c]; return v == null ? "" : String(v); };
+  var origFlag = function (r, c) { return !!(S.flags[r] && S.flags[r][c]); };
+  var curFlag = function (r, c) { var k = key(r, c); return k in pendingFlags ? pendingFlags[k] : origFlag(r, c); };
+
+  function dirtyCount() { return Object.keys(pendingEdits).length + Object.keys(pendingFlags).length; }
+
+  function render() {
+    var h = "<thead><tr>" + S.columns.map(function (c) {
+      return "<th>" + esc(c.replace(/_/g, " ")) + "</th>";
+    }).join("") + "</tr></thead><tbody>";
+    S.rows.forEach(function (row) {
+      var r = row._i;
+      h += "<tr>";
+      S.columns.forEach(function (c) {
+        var k = key(r, c), cls = [], tip = "";
+        var edited = k in pendingEdits;
+        var val = edited ? pendingEdits[k].value : origVal(row, c);
+        if (S.editable.indexOf(c) < 0) cls.push("ro");
+        if (curFlag(r, c)) {
+          cls.push("flag");
+          tip = (S.flags[r] && S.flags[r][c]) || "Manually flagged";
+        }
+        if (edited) cls.push("edited");
+        if (k in pendingFlags) cls.push("flagchg");
+        h += '<td class="' + cls.join(" ") + '" data-r="' + r + '" data-c="' + c + '"' +
+             (tip ? ' title="' + esc(tip) + '"' : "") + ">" + esc(val) + "</td>";
+      });
+      h += "</tr>";
+    });
+    $tbl.innerHTML = h + "</tbody>";
+
+    var n = dirtyCount();
+    $foot.className = n ? "dirty" : "";
+    $pending.textContent = n + " unsaved change" + (n === 1 ? "" : "s");
+    document.getElementById("save").disabled = saving;
+    document.getElementById("cancel").disabled = saving;
+    document.getElementById("save").textContent = saving ? "Saving…" : "Save";
+    var want = Math.min(S.rows.length * 31 + 38, 520) + 30 + 48 + 14;
+    send("streamlit:setFrameHeight", { height: want });
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (m) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m];
+    });
+  }
+
+  // ---- editing ----
+  function startEdit(td) {
+    var r = +td.dataset.r, c = td.dataset.c;
+    if (S.editable.indexOf(c) < 0) return;
+    var row = S.rows.filter(function (x) { return x._i === r; })[0];
+    var k = key(r, c);
+    var start = k in pendingEdits ? pendingEdits[k].value : origVal(row, c);
+    td.className = "editing";
+    td.innerHTML = '<input type="text" value="' + esc(start) + '">';
+    var inp = td.firstChild; inp.focus(); inp.select();
+    var done = false;
+    function commit(save) {
+      if (done) return; done = true;
+      if (save) {
+        var v = inp.value.trim();
+        if (v === origVal(row, c).trim()) delete pendingEdits[k];
+        else pendingEdits[k] = { row: r, col: c, value: v };
+      }
+      render();
+    }
+    inp.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") commit(true);
+      else if (e.key === "Escape") commit(false);
+    });
+    inp.addEventListener("blur", function () { commit(true); });
+  }
+
+  function toggleFlag(r, c) {
+    var k = key(r, c), want = !curFlag(r, c);
+    if (want === origFlag(r, c)) delete pendingFlags[k]; else pendingFlags[k] = want;
+    render();
+  }
+
+  // ---- context menu ----
+  function openMenu(e, td) {
+    e.preventDefault();
+    var r = +td.dataset.r, c = td.dataset.c, k = key(r, c);
+    var canEdit = S.editable.indexOf(c) >= 0, flagged = curFlag(r, c);
+    var items = [
+      { label: "✏️  Edit cell", on: canEdit, fn: function () { startEdit(td); } },
+      { label: flagged ? "⚐  Unflag cell" : "⚑  Flag cell", on: true, fn: function () { toggleFlag(r, c); } }
+    ];
+    if (k in pendingEdits || k in pendingFlags) {
+      items.push({ label: "↩  Revert this cell", on: true, fn: function () {
+        delete pendingEdits[k]; delete pendingFlags[k]; render(); } });
+    }
+    $menu.innerHTML = "";
+    items.forEach(function (it) {
+      var d = document.createElement("div");
+      d.textContent = it.label;
+      if (!it.on) d.className = "dis";
+      d.addEventListener("click", function (ev) {
+        ev.stopPropagation(); if (!it.on) return; hideMenu(); it.fn();
+      });
+      $menu.appendChild(d);
+    });
+    $menu.style.display = "block";
+    var w = $menu.offsetWidth, hgt = $menu.offsetHeight;
+    $menu.style.left = Math.max(0, Math.min(e.clientX, window.innerWidth - w - 4)) + "px";
+    $menu.style.top = Math.max(0, Math.min(e.clientY, window.innerHeight - hgt - 4)) + "px";
+  }
+  function hideMenu() { $menu.style.display = "none"; }
+
+  document.addEventListener("click", hideMenu);
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") hideMenu(); });
+  document.getElementById("scroller").addEventListener("scroll", hideMenu);
+  $tbl.addEventListener("contextmenu", function (e) {
+    var td = e.target.closest("td"); if (td && td.dataset.r !== undefined) openMenu(e, td);
+  });
+  $tbl.addEventListener("dblclick", function (e) {
+    var td = e.target.closest("td"); if (td && td.dataset.r !== undefined) startEdit(td);
+  });
+
+  // ---- save / cancel ----
+  document.getElementById("cancel").addEventListener("click", function () {
+    pendingEdits = {}; pendingFlags = {}; render();   // back to exactly how it was
+  });
+  document.getElementById("save").addEventListener("click", function () {
+    if (saving || !dirtyCount()) return;
+    saving = true; render();
+    send("streamlit:setComponentValue", { dataType: "json", value: {
+      action: "save",
+      token: Date.now() + "-" + Math.random().toString(36).slice(2),
+      version: S.version,
+      edits: Object.keys(pendingEdits).map(function (k) { return pendingEdits[k]; }),
+      flags: Object.keys(pendingFlags).map(function (k) {
+        var p = k.split("|"); return { row: +p[0], col: p.slice(1).join("|"), flagged: pendingFlags[k] };
+      })
+    }});
+    clearTimeout(saveTimer);
+    // If Python rejects the save (error), version never changes: unlock the buttons.
+    saveTimer = setTimeout(function () { saving = false; render(); }, 8000);
+  });
+
+  // ---- receive data from Python ----
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    var a = e.data.args || {};
+    var newVersion = a.version;
+    if (S.version !== null && newVersion !== S.version) {   // dataset changed or save succeeded
+      pendingEdits = {}; pendingFlags = {}; saving = false; clearTimeout(saveTimer);
+    }
+    S.rows = a.rows || []; S.columns = a.columns || []; S.editable = a.editable || [];
+    S.flags = a.flags || {}; S.version = newVersion;
+    if (!document.activeElement || document.activeElement.tagName !== "INPUT") render();
+  });
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>
