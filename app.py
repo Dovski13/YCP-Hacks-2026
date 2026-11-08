@@ -9,13 +9,22 @@ import time
 import os
 import base64
 import hashlib
+import tempfile
 import requests
+import numpy as np
+import cv2
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy import create_engine, inspect as sa_inspect, text as sa_text, types as sa_types
 import snowflake.snowpark as snowpark
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import asyncio
 from solana.rpc.async_api import AsyncClient
@@ -49,8 +58,8 @@ except ImportError:
 
 # Configure the Streamlit page
 st.set_page_config(
-    page_title="MRG Labs Sampler", 
-    page_icon="MRGLogo.png",  # Update this string to match your exact file name
+    page_title="Grease of Mind", 
+    page_icon="GreaseOfMindLogo.png",  # Update this string to match your exact file name
     layout="wide"
 )
 
@@ -76,6 +85,11 @@ OCR_TO_SF = {
 # Inject MRG Labs CSS Theme, Bento Box Layout, and Spinning Loading Circle
 st.markdown("""
     <style>
+        /* Reduce the top padding of the main Streamlit container */
+        .block-container {
+            padding-top: 2rem !important;
+            padding-bottom: 0rem !important;
+        }
         /* MRG Labs Brand Styling */
         :root {
             --mrg-blue: #004B87;
@@ -146,13 +160,6 @@ st.markdown("""
         #close-alert { display: none; }
         #close-alert:checked ~ .alert-box { display: none; }
 
-        /* Prevent Streamlit from fading out elements (like Minesweeper) while processing */
-        [data-testid="stComponentBlock"], [data-testid="stComponentBlock"] iframe, .stElementContainer {
-            opacity: 1 !important;
-            transition: none !important;
-            filter: none !important;
-        }
-
         /* OVERALL: Replace Streamlit default running indicator (running people/man) with a sleek spinning loading circle */
         [data-testid="stStatusWidget"] svg,
         [data-testid="stStatusWidget"] img,
@@ -162,13 +169,16 @@ st.markdown("""
             display: none !important;
         }
 
-        [data-testid="stStatusWidget"] button,
-        .stStatusWidget button {
-            display: inline-flex !important;
-            align-items: center !important;
+        /* Hide all widget contents (Stop button, "Running..." text); keep only the single spinner */
+        [data-testid="stStatusWidget"] > *,
+        .stStatusWidget > * {
+            display: none !important;
+        }
+        [data-testid="stStatusWidget"],
+        .stStatusWidget {
+            font-size: 0 !important;
         }
 
-        [data-testid="stStatusWidget"] button::before,
         [data-testid="stStatusWidget"]::before,
         .stStatusWidget::before {
             content: "" !important;
@@ -179,8 +189,23 @@ st.markdown("""
             border-top: 2.5px solid #004B87 !important;
             border-radius: 50% !important;
             animation: mrg-spin 0.75s linear infinite !important;
-            margin-right: 8px !important;
+            margin: 0 !important;
             flex-shrink: 0 !important;
+        }
+
+        /* Loading indicator: top-center, 2x size */
+        [data-testid="stStatusWidget"],
+        .stStatusWidget {
+            position: fixed !important;
+            top: 1rem !important;
+            left: 50% !important;
+            right: auto !important;
+            transform: translateX(-50%) scale(2) !important;
+            transform-origin: top center !important;
+            z-index: 999999 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
         }
 
         @keyframes mrg-spin {
@@ -252,7 +277,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("MRG Labs: Sample Label Scanner")
+st.image("GreaseOfMindLogo.png", width=200)
 
 # Initialize session state variables
 if 'uploader_key' not in st.session_state:
@@ -269,8 +294,17 @@ if 'msgs' not in st.session_state:
     st.session_state.msgs = []
 if 'ai_grease_analysis' not in st.session_state:
     st.session_state.ai_grease_analysis = None
+if 'grok_qc_report' not in st.session_state:
+    st.session_state.grok_qc_report = None
+if 'grok_qc_error' not in st.session_state:
+    st.session_state.grok_qc_error = None
+if 'is_processing' not in st.session_state:
+    st.session_state.is_processing = False
 
 api_key = os.environ.get("GEMINI_API_KEY")
+XAI_API_KEY = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-3-mini")
+GROK_QC_LOG = os.environ.get("GROK_QC_LOG", "grok_qc_log.md")
 
 if not api_key:
     st.error("Server Configuration Error: GEMINI_API_KEY environment variable is not set.")
@@ -1294,6 +1328,84 @@ def push_ocr_batch_to_snowflake(df: pd.DataFrame) -> str:
         session.close()
 
 
+def build_batch_qc_stats(df: pd.DataFrame) -> dict:
+    """Lightweight batch stats sent to Grok for automated QC (no raw images)."""
+    work = df.copy()
+    for col in [
+        "Sample ID", "Tube Size", "Date Sampled", "Date Received",
+        "Machine", "Component", "Serial Number", "Reference Lube",
+    ]:
+        if col not in work.columns:
+            work[col] = None
+    sample_ids = work["Sample ID"].astype(str)
+    missing_sample_id = int(
+        ((sample_ids == "") | sample_ids.isna() | (sample_ids == "nan") | (sample_ids == "ERROR")).sum()
+    )
+    dup_ids = sample_ids[sample_ids.duplicated(keep=False) & ~sample_ids.isin(["", "nan", "ERROR", "None"])]
+    missing_fields = {
+        col: int(work[col].isna().sum() + (work[col].astype(str).str.strip() == "").sum())
+        for col in ["Tube Size", "Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube"]
+    }
+    preview_cols = [c for c in [
+        "Sample ID", "Tube Size", "Date Sampled", "Date Received", "Machine",
+        "Component", "Serial Number", "Reference Lube",
+    ] if c in work.columns]
+    return {
+        "row_count": int(len(work)),
+        "missing_or_error_sample_ids": missing_sample_id,
+        "duplicate_sample_id_count": int(dup_ids.nunique()),
+        "duplicate_sample_ids": sorted(dup_ids.dropna().astype(str).unique().tolist())[:20],
+        "missing_field_counts": missing_fields,
+        "preview_rows": work[preview_cols].head(15).fillna("").astype(str).to_dict(orient="records"),
+    }
+
+
+def run_grok_batch_qc(df: pd.DataFrame, batch_id: str | None = None) -> str:
+    """Auto QC via xAI Grok. XAI_API_KEY authenticates the chat completions call."""
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY (or GROK_API_KEY) is not set — cannot run Grok automation.")
+    stats = build_batch_qc_stats(df)
+    resp = requests.post(
+        "https://api.x.ai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": GROK_MODEL,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Grok, the automated QC reviewer for MRG Laboratories sample intake. "
+                        "Given batch statistics from OCR → Tiger Data → Snowflake, produce a concise ops report. "
+                        "Flag missing entries, duplicate Sample IDs, and tube-size issues. "
+                        "End with READY TO SUBMIT or NEEDS REVIEW and 2-4 bullet actions."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Batch ID: {batch_id or 'UNKNOWN'}\n"
+                        f"Stats JSON:\n{json.dumps(stats, default=str)}"
+                    ),
+                },
+            ],
+        },
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Grok API error {resp.status_code}: {resp.text[:500]}")
+    report = resp.json()["choices"][0]["message"]["content"].strip()
+    stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(GROK_QC_LOG, "a", encoding="utf-8") as log:
+        log.write(
+            f"\n## Grok QC — {stamp}\n"
+            f"- Model: `{GROK_MODEL}`\n"
+            f"- Batch: `{batch_id or 'UNKNOWN'}`\n"
+            f"- Rows: {stats['row_count']}\n\n{report}\n\n---\n"
+        )
+    return report
+
+
 def anchor_to_solana(extracted_data):
     """Anchors the sample metadata to Solana Devnet via SPL Memo."""
     async def _send_tx():
@@ -1351,14 +1463,81 @@ def anchor_to_solana(extracted_data):
         return f"Solana Execution Failed: {str(e)}"
 
 
+IMAGE_EXTS = ("jpg", "jpeg", "png")
+VIDEO_EXTS = ("mp4", "mov", "m4v", "avi", "webm", "mkv")
+VIDEO_FRAMES_TO_KEEP = 6      # frames sent to Gemini per video
+VIDEO_CANDIDATES_PER_SEG = 6  # frames scored for sharpness per segment
+
+
+def is_video_file(uploaded_file) -> bool:
+    ext = os.path.splitext(uploaded_file.name)[1].lstrip(".").lower()
+    return ext in VIDEO_EXTS
+
+
+def extract_video_frames(uploaded_file, n_keep=VIDEO_FRAMES_TO_KEEP, per_seg=VIDEO_CANDIDATES_PER_SEG):
+    """Split video into n_keep time segments; keep the sharpest frame of each.
+    Spread across time = spread across the spin = whole label covered.
+    Sharpest-pick drops motion-blurred frames."""
+    ext = os.path.splitext(uploaded_file.name)[1] or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = tmp.name
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            raise ValueError("Could not read video (unsupported codec?)")
+
+        frames = []
+        seg_len = total / n_keep
+        for s in range(n_keep):
+            start = int(s * seg_len)
+            end = max(start + 1, int((s + 1) * seg_len))
+            idxs = np.linspace(start, end - 1, per_seg).astype(int)
+            best, best_score = None, -1.0
+            for i in idxs:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                score = cv2.Laplacian(gray, cv2.CV_64F).var()
+                if score > best_score:
+                    best, best_score = frame, score
+            if best is not None:
+                img = Image.fromarray(cv2.cvtColor(best, cv2.COLOR_BGR2RGB))
+                img.thumbnail((1024, 1024))
+                frames.append(img)
+        cap.release()
+        if not frames:
+            raise ValueError("No frames extracted from video")
+        return frames
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 def process_label(client, uploaded_file):
     try:
-        image = Image.open(uploaded_file)
-        image.thumbnail((1024, 1024))
+        if is_video_file(uploaded_file):
+            images = extract_video_frames(uploaded_file)
+            source_note = (
+                f"The {len(images)} images are frames, in order, from a video of ONE sample tube "
+                "being rotated so the whole label is visible. Each frame shows only part of the label. "
+                "Combine information across ALL frames into a single result. Do not return one result per frame."
+            )
+        else:
+            image = Image.open(uploaded_file)
+            image.thumbnail((1024, 1024))
+            images = [image]
+            source_note = "The image shows a sample label."
 
         prompt = """
         You are an OCR and data extraction assistant for a laboratory.
-        Analyze the provided image of a sample label. Determine if it is a 'Large' or 'Small' sample label based on the fields present.
+        """ + source_note + """
+        Determine if it is a 'Large' or 'Small' sample label based on the fields present.
 
         Extract the data to match these exact rules:
         If Large:
@@ -1390,7 +1569,7 @@ def process_label(client, uploaded_file):
             try:
                 response = client.models.generate_content(
                     model='gemini-3.7-flash',
-                    contents=[prompt, image]
+                    contents=[prompt, *images]
                 )
                 break
             except Exception as api_error:
@@ -1421,86 +1600,110 @@ def process_label(client, uploaded_file):
         }
 
 
-tab1, tab2, tab3 = st.tabs(["Image Upload", "Data Viewer", "Snowflake Intake"])
+tab1, tab2, tab3 = st.tabs(["Image Upload", "Data Viewer", "Snowflake Analysis"])
 
 with tab1:
     col_text, col_btn = st.columns([3, 1])
     with col_text:
-        st.markdown("<h4 style='margin-top: 0.5rem;'>Upload Label Images (JPG, PNG)</h4>", unsafe_allow_html=True)
+        st.markdown("<h4 style='margin-top: 0.5rem;'>Upload Label Images (JPG, PNG) or Spin Videos (MP4, MOV)</h4>", unsafe_allow_html=True)
     with col_btn:
         if st.button("Clear All", use_container_width=True):
             st.session_state.uploader_key += 1
             st.session_state.generated_csv = None
             st.session_state.processed_df = None
+            st.session_state.is_processing = False
             st.rerun()
 
     uploaded_files = st.file_uploader(
-        "Upload Label Images (JPG, PNG)",
-        type=["jpg", "jpeg", "png"],
+        "Upload Label Images or Videos",
+        type=list(IMAGE_EXTS + VIDEO_EXTS),
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.uploader_key}",
         label_visibility="collapsed"
     )
 
     if uploaded_files:
-        st.write(f"**{len(uploaded_files)} images ready to process.**")
+        n_vid = sum(1 for f in uploaded_files if is_video_file(f))
+        n_img = len(uploaded_files) - n_vid
+        st.write(f"**{n_img} images, {n_vid} videos ready to process.**")
 
         user_file_name = st.text_input("Enter CSV file name:", "bulk_lab_samples_output")
 
-        if st.button("Process All Labels"):
-            client = genai.Client(api_key=api_key)
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            results = []
+        if st.button("Process All Labels", disabled=st.session_state.is_processing):
+            st.session_state.is_processing = True
+            st.rerun()
 
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(process_label, client, f) for f in uploaded_files]
-                for i, future in enumerate(as_completed(futures)):
-                    result = future.result()
-                    results.append(result)
-                    current_progress = (i + 1) / len(uploaded_files)
-                    progress_bar.progress(current_progress)
-                    status_text.text(f"Processed {i + 1} of {len(uploaded_files)} labels...")
-
-            columns = [
-                "Sample ID", "Tube Size", "Date Sampled", "Date Received",
-                "Machine", "Component", "Serial Number", "Reference Lube",
-                "Solana Audit Trail"
-            ]
-
-            df = pd.DataFrame(results)
-            for c in columns:
-                if c not in df.columns:
-                    df[c] = None
-            df = df.reindex(columns=columns)
-
-            df['Date Sampled'] = pd.to_datetime(df['Date Sampled'], errors='coerce').dt.date
-
-            # 1) Send CSV/data to Tiger Data
-            db_uri = os.environ.get("TIGERDATA_URI")
-            if db_uri:
-                try:
-                    engine = create_engine(db_uri)
-                    # Drop non-standard columns so it matches the SQL database schema
-                    db_df = df.drop(columns=["Solana Audit Trail", "Tube Size", "TUBE_SIZE"], errors='ignore')
-                    db_df.to_sql('lab_samples', con=engine, if_exists='append', index=False)
-                    st.toast("Wrote batch to Tiger Data")
-                except Exception as e:
-                    st.error(f"Failed to write to Tiger Data: {e}")
-            else:
-                st.warning("TIGERDATA_URI is not set — skipped Tiger Data write.")
-
-            # 2) Then send the same batch to Snowflake intake staging
+        if st.session_state.is_processing:
             try:
-                batch_id = push_ocr_batch_to_snowflake(df)
-                st.session_state.last_snowflake_batch = batch_id
-                st.toast(f"Synced batch {batch_id} to Snowflake")
-            except Exception as e:
-                st.error(f"Failed to write to Snowflake: {e}")
+                client = genai.Client(api_key=api_key)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results = []
 
-            st.session_state.processed_df = df
-            st.session_state.generated_csv = df.to_csv(index=False).encode('utf-8')
-            st.session_state.csv_filename = f"{user_file_name}.csv"
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    futures = [executor.submit(process_label, client, f) for f in uploaded_files]
+                    for i, future in enumerate(as_completed(futures)):
+                        result = future.result()
+                        results.append(result)
+                        current_progress = (i + 1) / len(uploaded_files)
+                        progress_bar.progress(current_progress)
+                        status_text.text(f"Processed {i + 1} of {len(uploaded_files)} labels...")
+
+                columns = [
+                    "Sample ID", "Tube Size", "Date Sampled", "Date Received",
+                    "Machine", "Component", "Serial Number", "Reference Lube",
+                    "Solana Audit Trail"
+                ]
+
+                df = pd.DataFrame(results)
+                for c in columns:
+                    if c not in df.columns:
+                        df[c] = None
+                df = df.reindex(columns=columns)
+
+                df['Date Sampled'] = pd.to_datetime(df['Date Sampled'], errors='coerce').dt.date
+
+                # 1) Send CSV/data to Tiger Data
+                db_uri = os.environ.get("TIGERDATA_URI")
+                if db_uri:
+                    try:
+                        engine = create_engine(db_uri)
+                        # Drop non-standard columns so it matches the SQL database schema
+                        db_df = df.drop(columns=["Solana Audit Trail", "Tube Size", "TUBE_SIZE"], errors='ignore')
+                        db_df.to_sql('lab_samples', con=engine, if_exists='append', index=False)
+                        st.toast("Wrote batch to Tiger Data")
+                    except Exception as e:
+                        st.error(f"Failed to write to Tiger Data: {e}")
+                else:
+                    st.warning("TIGERDATA_URI is not set — skipped Tiger Data write.")
+
+                # 2) Then send the same batch to Snowflake intake staging
+                batch_id = None
+                try:
+                    batch_id = push_ocr_batch_to_snowflake(df)
+                    st.session_state.last_snowflake_batch = batch_id
+                    st.toast(f"Synced batch {batch_id} to Snowflake")
+                except Exception as e:
+                    st.error(f"Failed to write to Snowflake: {e}")
+
+                # 3) Auto-run Grok QC after Tiger Data + Snowflake
+                st.session_state.grok_qc_report = None
+                st.session_state.grok_qc_error = None
+                try:
+                    with st.spinner("Grok automation: reviewing batch QC…"):
+                        st.session_state.grok_qc_report = run_grok_batch_qc(df, batch_id)
+                    st.toast("Grok QC complete")
+                except Exception as e:
+                    st.session_state.grok_qc_error = str(e)
+                    st.warning(f"Grok automation skipped/failed: {e}")
+
+                st.session_state.processed_df = df
+                st.session_state.generated_csv = df.to_csv(index=False).encode('utf-8')
+                st.session_state.csv_filename = f"{user_file_name}.csv"
+            finally:
+                # Reset the button state and refresh the UI when finished (or if an error occurs)
+                st.session_state.is_processing = False
+                st.rerun()
 
     # Tab 1: Popups removed; displays dataframe and download button directly
     if st.session_state.generated_csv is not None:
@@ -1512,147 +1715,13 @@ with tab1:
             file_name=st.session_state.csv_filename,
             mime="text/csv",
         )
-
-    # --- MINESWEEPER COMPONENT ---
-    st.markdown("---")
-    st.markdown("<h5 style='text-align: center; color: #004B87;'>Waiting for images to process? Play a round!</h5>", unsafe_allow_html=True)
-
-    minesweeper_html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <style>
-        body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0; padding-top: 10px; color: #333; }
-        #board { display: grid; grid-template-columns: repeat(10, 30px); gap: 2px; margin-top: 10px; }
-        .cell { width: 30px; height: 30px; background-color: #f0f2f6; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 14px; cursor: pointer; border-radius: 4px; user-select: none; }
-        .cell:hover { background-color: #e0e2e6; }
-        .cell.revealed { background-color: #ffffff; border: 1px solid #ddd; cursor: default; box-sizing: border-box; }
-        .cell.mine { background-color: #ffcccc; }
-        #status { margin-top: 15px; font-weight: bold; min-height: 20px; color: #004B87; }
-        button { margin-top: 10px; padding: 8px 16px; border: none; background: #004B87; color: white; border-radius: 4px; cursor: pointer; font-size: 14px; transition: all 0.3s ease; }
-        button:hover { background: #005A9E; }
-    </style>
-    </head>
-    <body>
-        <div id="board"></div>
-        <div id="status"></div>
-        <button onclick="initGame()">Restart Game</button>
-
-        <script>
-            const size = 10;
-            const mineCount = 12;
-            let board = [];
-            let revealed = 0;
-            let gameOver = false;
-
-            function initGame() {
-                board = Array(size).fill().map(() => Array(size).fill({ mine: false, revealed: false, flag: false, count: 0 }));
-                gameOver = false;
-                revealed = 0;
-                document.getElementById('status').innerText = "Right-click to flag mines";
-
-                let minesPlaced = 0;
-                while (minesPlaced < mineCount) {
-                    let r = Math.floor(Math.random() * size);
-                    let c = Math.floor(Math.random() * size);
-                    if (!board[r][c].mine) {
-                        board[r][c] = { ...board[r][c], mine: true };
-                        minesPlaced++;
-                    }
-                }
-
-                for (let r = 0; r < size; r++) {
-                    for (let c = 0; c < size; c++) {
-                        if (!board[r][c].mine) {
-                            let count = 0;
-                            for (let dr = -1; dr <= 1; dr++) {
-                                for (let dc = -1; dc <= 1; dc++) {
-                                    if (r+dr >= 0 && r+dr < size && c+dc >= 0 && c+dc < size && board[r+dr][c+dc].mine) count++;
-                                }
-                            }
-                            board[r][c] = { ...board[r][c], count };
-                        }
-                    }
-                }
-                render();
-            }
-
-            function render() {
-                const b = document.getElementById('board');
-                b.innerHTML = '';
-                for (let r = 0; r < size; r++) {
-                    for (let c = 0; c < size; c++) {
-                        let cell = document.createElement('div');
-                        cell.className = 'cell';
-                        if (board[r][c].revealed) {
-                            cell.classList.add('revealed');
-                            if (board[r][c].mine) {
-                                cell.classList.add('mine');
-                                cell.innerText = '💣';
-                            } else if (board[r][c].count > 0) {
-                                cell.innerText = board[r][c].count;
-                                const colors = ['#0000FF', '#008000', '#FF0000', '#000080', '#800000', '#008080', '#000000', '#808080'];
-                                cell.style.color = colors[board[r][c].count - 1];
-                            }
-                        } else if (board[r][c].flag) {
-                            cell.innerText = '🚩';
-                        }
-
-                        cell.onclick = () => reveal(r, c);
-                        cell.oncontextmenu = (e) => { e.preventDefault(); toggleFlag(r, c); };
-                        b.appendChild(cell);
-                    }
-                }
-            }
-
-            function reveal(r, c) {
-                if (gameOver || board[r][c].revealed || board[r][c].flag) return;
-
-                let cell = board[r][c];
-                cell.revealed = true;
-
-                if (cell.mine) {
-                    gameOver = true;
-                    document.getElementById('status').innerText = "Boom! Game Over.";
-                    document.getElementById('status').style.color = "red";
-                    revealAll();
-                } else {
-                    revealed++;
-                    if (revealed === size * size - mineCount) {
-                        gameOver = true;
-                        document.getElementById('status').innerText = "You Win! 🏆";
-                        document.getElementById('status').style.color = "green";
-                    } else if (cell.count === 0) {
-                        for (let dr = -1; dr <= 1; dr++) {
-                            for (let dc = -1; dc <= 1; dc++) {
-                                if (r+dr >= 0 && r+dr < size && c+dc >= 0 && c+dc < size) reveal(r+dr, c+dc);
-                            }
-                        }
-                    }
-                }
-                render();
-            }
-
-            function toggleFlag(r, c) {
-                if (gameOver || board[r][c].revealed) return;
-                board[r][c].flag = !board[r][c].flag;
-                render();
-            }
-
-            function revealAll() {
-                for (let r = 0; r < size; r++) {
-                    for (let c = 0; c < size; c++) {
-                        board[r][c].revealed = true;
-                    }
-                }
-            }
-
-            initGame();
-        </script>
-    </body>
-    </html>
-    """
-    components.html(minesweeper_html, height=450)
+        st.markdown("#### Grok Automation — Batch QC")
+        if st.session_state.grok_qc_report:
+            st.success("Grok auto-reviewed this batch after Tiger Data + Snowflake sync.")
+            st.markdown(st.session_state.grok_qc_report)
+            st.caption(f"Logged to `{GROK_QC_LOG}` · model `{GROK_MODEL}`")
+        elif st.session_state.grok_qc_error:
+            st.error(f"Grok QC error: {st.session_state.grok_qc_error}")
 
 with tab2:
     st.subheader("Live Database Records")
@@ -1783,7 +1852,6 @@ with tab2:
 
 # ---------- Snowflake Sample Intake (Dashboard + Reasoning AI) ----------
 with tab3:
-    st.subheader("MRG Laboratories — Grease Sample Intake & Intelligence")
 
     # CSV File Upload Field (Analysis is performed on this uploaded CSV)
     col_csv, col_tab1_ref = st.columns([3, 1])
@@ -1827,25 +1895,10 @@ with tab3:
         raw_base = normalize_raw(raw_data)
         data = validate_dataframe(apply_edit_overlay(raw_base, edit_state["edits"]))
         data, cell_flags = apply_flag_overrides(data, edit_state["flags"])
-        
-        # Optional sync to Snowflake Staging
-        with st.expander("❄️ Optional: Sync CSV to Snowflake Intake"):
-            col_push, col_push_info = st.columns([1, 2])
-            with col_push:
-                if st.button("Push Batch to Snowflake", key="sf_sync_push_btn"):
-                    try:
-                        synced_batch = push_ocr_batch_to_snowflake(data)
-                        st.session_state.last_snowflake_batch = synced_batch
-                        st.success(f"Synced {len(data)} samples into Snowflake batch: `{synced_batch}`")
-                    except Exception as sf_err:
-                        st.error(f"Snowflake sync error: {sf_err}")
-            with col_push_info:
-                if st.session_state.last_snowflake_batch:
-                    st.caption(f"Latest batch ID: `{st.session_state.last_snowflake_batch}`")
 
         # 3 Sub-tabs (Flagged samples sub-tab removed)
         tab_dash, tab_chat, tab_data = st.tabs(
-            ["Dashboard", "Ask the data", "Data"]
+            ["Dashboard", "Analyst", "Data"]
         )
 
         with tab_dash:
@@ -2015,18 +2068,6 @@ with tab3:
                         "Bad / Inverted Dates": int(data["HAS_BAD_DATE"].sum())
                     }
                     st.bar_chart(pd.Series(audit_cats).rename("Samples"), color="#F59E0B")
-
-            # High-Level Reasoning AI Intelligence Tile
-            st.markdown("""
-                <div class="bento-ai-container">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <h4 style="margin: 0; color: #004B87; font-size: 17px;">🧠 AI Tribology Intelligence & Pattern Detection</h4>
-                            <p style="margin: 4px 0 0 0; color: #475569; font-size: 13px;">High-level reasoning model analysis of equipment distress clusters, lubricant cross-mixing, and transit aging risks.</p>
-                        </div>
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
 
             col_run_ai, col_clear_ai = st.columns([2, 8])
             with col_run_ai:
